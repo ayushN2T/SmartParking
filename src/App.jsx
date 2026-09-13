@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { PARKING_FACILITIES, POPULAR_DESTINATIONS } from './data/parkingLots';
+import { collection, onSnapshot, getDocs, doc, setDoc, writeBatch, runTransaction } from 'firebase/firestore';
+import { db } from './services/firebase';
 import Navbar from './components/Navbar';
 import HomeView from './components/HomeView';
 import FindParkingView from './components/FindParkingView';
@@ -23,40 +25,46 @@ export default function App() {
     coords: { lat: 21.7645, lng: 72.1519, svgX: 360, svgY: 140 }
   });
   const [liveTickerCounter, setLiveTickerCounter] = useState(344);
-  const [lastSyncTime, setLastSyncTime] = useState('Real-Time (ICCC Live)');
+  const [lastSyncTime, setLastSyncTime] = useState('Real-Time (Firestore Live)');
   const [toastMessage, setToastMessage] = useState(null);
   const [isDatabaseConnected, setIsDatabaseConnected] = useState(false);
   const [bookingPassData, setBookingPassData] = useState(null);
 
-  // Fetch live facilities and destinations directly from MariaDB
-  const fetchFromDatabase = async () => {
-    try {
-      const [facRes, destRes] = await Promise.all([
-        fetch('/api/facilities.php'),
-        fetch('/api/destinations.php')
-      ]);
-
-      if (facRes.ok) {
-        const facJson = await facRes.json();
-        if (facJson.status === 'success' && Array.isArray(facJson.data) && facJson.data.length > 0) {
-          setFacilities(facJson.data);
-          setIsDatabaseConnected(true);
-        }
-      }
-
-      if (destRes.ok) {
-        const destJson = await destRes.json();
-        if (destJson.status === 'success' && Array.isArray(destJson.data) && destJson.data.length > 0) {
-          setDestinations(destJson.data);
-        }
-      }
-    } catch (err) {
-      console.warn('Database fetch fallback: using local schema dataset', err);
-    }
-  };
-
+  // Fetch live facilities and destinations directly from Firestore
   useEffect(() => {
+    let unsubscribeFacilities = null;
+
+    const fetchFromDatabase = async () => {
+      try {
+        // Real-time listener for facilities
+        unsubscribeFacilities = onSnapshot(collection(db, 'facilities'), (snapshot) => {
+          if (!snapshot.empty) {
+            const facList = [];
+            snapshot.forEach(doc => facList.push({ id: doc.id, ...doc.data() }));
+            setFacilities(facList);
+            setIsDatabaseConnected(true);
+          }
+        }, (err) => {
+          console.warn('Firebase facilities fetch fallback', err);
+        });
+
+        // One-time fetch for destinations
+        const destSnapshot = await getDocs(collection(db, 'destinations'));
+        if (!destSnapshot.empty) {
+          const destList = [];
+          destSnapshot.forEach(doc => destList.push({ id: doc.id, ...doc.data() }));
+          setDestinations(destList);
+        }
+      } catch (err) {
+        console.warn('Database fetch fallback: using local schema dataset', err);
+      }
+    };
+
     fetchFromDatabase();
+
+    return () => {
+      if (unsubscribeFacilities) unsubscribeFacilities();
+    };
   }, []);
 
   // Live telemetry ticker interval
@@ -108,28 +116,56 @@ export default function App() {
   };
 
   const handleBookTicket = async (facilityId) => {
-    if (facilityId) setSelectedFacilityId(facilityId);
+    const targetId = facilityId || selectedFacilityId;
+    setSelectedFacilityId(targetId);
 
-    // Call MariaDB booking endpoint
+    // Create booking in Firestore using a Transaction to ensure atomic spaces update
     try {
-      const res = await fetch('/api/book.php', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          facility_id: facilityId || selectedFacilityId,
+      const facilityRef = doc(db, 'facilities', targetId);
+      const bookingId = `BK-${Date.now()}`;
+      const bookingRef = doc(db, 'bookings', bookingId);
+
+      await runTransaction(db, async (transaction) => {
+        const facDoc = await transaction.get(facilityRef);
+        if (!facDoc.exists()) {
+          throw new Error("Facility does not exist!");
+        }
+
+        const data = facDoc.data();
+        if (data.availableSpaces <= 0) {
+          throw new Error("Parking facility is full!");
+        }
+
+        const newAvail = data.availableSpaces - 1;
+        const newOcc = data.occupiedSpaces + 1;
+        let newStatus = 'available';
+        if (newAvail === 0) newStatus = 'full';
+        else if ((newAvail / data.totalSpaces) < 0.35) newStatus = 'limited';
+
+        transaction.update(facilityRef, {
+          availableSpaces: newAvail,
+          occupiedSpaces: newOcc,
+          status: newStatus
+        });
+
+        transaction.set(bookingRef, {
+          facility_id: targetId,
           vehicle_plate: 'GJ-04-AB-1892',
           vehicle_type: '4w',
-          fastag: true
-        })
+          fastag: true,
+          timestamp: new Date().toISOString()
+        });
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.status === 'success') {
-          setBookingPassData(data);
-        }
-      }
+
+      setBookingPassData({
+        status: 'success',
+        booking_id: bookingId,
+        facility_id: targetId,
+        message: 'Successfully booked via Firestore'
+      });
     } catch (e) {
-      console.warn('Pass stored locally', e);
+      console.warn('Booking stored locally (Firebase error)', e);
+      setBookingPassData({ status: 'success', booking_id: `LOCAL-${Date.now()}`, facility_id: targetId });
     }
 
     setIsModalOpen(true);
@@ -141,26 +177,40 @@ export default function App() {
     window.open(`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(target)}`, '_blank');
   };
 
-  // Simulate Sensor Tick - Updates MariaDB and re-fetches
+  // Simulate Sensor Tick - Updates Firestore and real-time listeners automatically pick it up
   const handleSimulateTick = async () => {
     try {
-      const res = await fetch('/api/simulate-tick.php', { method: 'POST' });
-      if (res.ok) {
-        const json = await res.json();
-        if (json.status === 'success') {
-          setLastSyncTime(json.timestamp || new Date().toLocaleTimeString());
-          setToastMessage('📡 Sensor Network Synced: Real-time curb telemetry updated.');
-          // Refresh from database
-          fetchFromDatabase();
-          setTimeout(() => setToastMessage(null), 3500);
-          return;
+      const batch = writeBatch(db);
+      
+      facilities.forEach(f => {
+        if (Math.random() > 0.5) {
+          const delta = Math.floor(Math.random() * 3) - 1;
+          const newAvail = Math.max(0, Math.min(f.totalSpaces, f.availableSpaces + delta));
+          const newOcc = f.totalSpaces - newAvail;
+          let newStatus = 'available';
+          if (newAvail === 0) newStatus = 'full';
+          else if ((newAvail / f.totalSpaces) < 0.35) newStatus = 'limited';
+
+          const docRef = doc(db, 'facilities', f.id);
+          batch.update(docRef, {
+            availableSpaces: newAvail,
+            occupiedSpaces: newOcc,
+            status: newStatus
+          });
         }
-      }
+      });
+      
+      await batch.commit();
+      const nowStr = new Date().toLocaleTimeString();
+      setLastSyncTime(nowStr);
+      setToastMessage('📡 Sensor Network Synced: Real-time curb telemetry updated in Firestore.');
+      setTimeout(() => setToastMessage(null), 3500);
+      return;
     } catch (err) {
-      console.warn('API tick fallback', err);
+      console.warn('Firestore tick fallback', err);
     }
 
-    // Client-side fallback if server offline
+    // Client-side fallback if Firestore offline
     setFacilities(prev => {
       return prev.map(f => {
         if (Math.random() > 0.5) {
@@ -184,7 +234,7 @@ export default function App() {
 
     const nowStr = new Date().toLocaleTimeString();
     setLastSyncTime(nowStr);
-    setToastMessage('📡 Sensor Network Synced: Real-time curb telemetry updated across Bhavnagar.');
+    setToastMessage('📡 Sensor Network Synced: Real-time curb telemetry updated locally.');
     setTimeout(() => setToastMessage(null), 3500);
   };
 
@@ -233,8 +283,8 @@ export default function App() {
           <DirectoryView
             facilities={facilities}
             onSelectFacility={(id) => {
-              setSelectedFacilityId(id);
-              setActiveView('find-parking');
+               setSelectedFacilityId(id);
+               setActiveView('find-parking');
             }}
             onDirections={handleGetDirections}
           />
